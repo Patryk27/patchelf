@@ -1,6 +1,6 @@
 LIBS =
 
-check_PROGRAMS = simple-pie simple simple-execstack main too-many-strtab main-scoped big-dynstr no-rpath contiguous-note-sections
+check_PROGRAMS = simple-pie simple simple-execstack main too-many-strtab main-scoped big-dynstr no-rpath contiguous-note-sections introspection
 
 no_rpath_arch_TESTS = \
   no-rpath-amd64.sh \
@@ -51,7 +51,8 @@ src_TESTS = \
   overlapping-segments-after-rounding.sh \
   shared-rpath.sh \
   short-first-segment.sh \
-  empty-note.sh
+  empty-note.sh \
+  introspection.sh
 
 build_TESTS = \
   $(no_rpath_arch_TESTS)
@@ -88,6 +89,9 @@ simple_pie_CFLAGS = -fPIC -pie
 simple_execstack_SOURCES = simple.c
 simple_execstack_CFLAGS =
 simple_execstack_LDFLAGS = -Wl,-z,execstack
+
+introspection_SOURCES = introspection.c
+introspection_LDFLAGS = $(LDFLAGS_local)
 
 main_SOURCES = main.c
 main_LDADD = -lfoo $(AM_LDADD)

@@ -33,6 +33,12 @@ private:
     size_t len;
 };
 
+struct ReplacedSection {
+    size_t prev_addr;
+    size_t prev_size;
+    std::string data;
+};
+
 template<ElfFileParams>
 class ElfFile
 {
@@ -52,7 +58,7 @@ private:
     bool isExecutable = false;
 
     using SectionName = std::string;
-    using ReplacedSections = std::map<SectionName, std::string>;
+    using ReplacedSections = std::map<SectionName, ReplacedSection>;
 
     ReplacedSections replacedSections;
 
