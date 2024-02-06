@@ -127,6 +127,14 @@ constexpr I ElfFile<ElfFileParamNames>::rdi(I i) const noexcept
     return r;
 }
 
+static void warn(const char * format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    fprintf(stderr, "warning: ");
+    vfprintf(stderr, format, ap);
+    va_end(ap);
+}
 
 static void debug(const char * format, ...)
 {
@@ -645,21 +653,27 @@ std::string & ElfFile<ElfFileParamNames>::replaceSection(const SectionName & sec
     unsigned int size)
 {
     auto i = replacedSections.find(sectionName);
-    std::string s;
+    std::string data;
 
-    if (i != replacedSections.end()) {
-        s = std::string(i->second);
-    } else {
+    if (i == replacedSections.end()) {
         auto shdr = findSectionHeader(sectionName);
-        s = extractString(fileContents, rdi(shdr.sh_offset), rdi(shdr.sh_size));
+        ReplacedSection rs;
+
+        rs.prev_addr = rdi(shdr.sh_addr);
+        rs.prev_size = rdi(shdr.sh_size);
+
+        replacedSections[sectionName] = rs;
+
+        data = extractString(fileContents, rdi(shdr.sh_offset), rdi(shdr.sh_size));
+    } else {
+        data = std::string(i->second.data);
     }
 
-    s.resize(size);
-    replacedSections[sectionName] = s;
+    data.resize(size);
+    replacedSections[sectionName].data = data;
 
-    return replacedSections[sectionName];
+    return replacedSections[sectionName].data;
 }
-
 
 template<ElfFileParams>
 void ElfFile<ElfFileParamNames>::writeReplacedSections(Elf_Off & curOff,
@@ -689,15 +703,15 @@ void ElfFile<ElfFileParamNames>::writeReplacedSections(Elf_Off & curOff,
 
         Elf_Shdr orig_shdr = shdr;
         debug("rewriting section '%s' from offset 0x%x (size %d) to offset 0x%x (size %d)\n",
-            sectionName.c_str(), rdi(shdr.sh_offset), rdi(shdr.sh_size), curOff, i->second.size());
+            sectionName.c_str(), rdi(shdr.sh_offset), rdi(shdr.sh_size), curOff, i->second.data.size());
 
-        memcpy(fileContents->data() + curOff, i->second.c_str(),
-            i->second.size());
+        memcpy(fileContents->data() + curOff, i->second.data.c_str(),
+            i->second.data.size());
 
         /* Update the section header for this section. */
         wri(shdr.sh_offset, curOff);
         wri(shdr.sh_addr, startAddr + (curOff - startOffset));
-        wri(shdr.sh_size, i->second.size());
+        wri(shdr.sh_size, i->second.data.size());
         wri(shdr.sh_addralign, sectionAlignment);
 
         /* If this is the .interp section, then the PT_INTERP segment
@@ -787,10 +801,51 @@ void ElfFile<ElfFileParamNames>::writeReplacedSections(Elf_Off & curOff,
             }
         }
 
-        curOff += roundUp(i->second.size(), sectionAlignment);
+        curOff += roundUp(i->second.data.size(), sectionAlignment);
     }
 
-    replacedSections.clear();
+    /* Expand the LOAD segment as neccessary */
+    for (auto & i : replacedSections) {
+        std::string sectionName = i.first;
+
+        /* If this is the .dynstr or .dynsym section, then a PT_LOAD segment
+           must contain it. */
+        if (sectionName == ".dynstr" || sectionName == ".dynsym") {
+            auto const & shdr = findSectionHeader(sectionName);
+            bool loaded = false;
+
+            for (auto & phdr : phdrs) {
+                if (rdi(phdr.p_type) == PT_LOAD) {
+                    if (rdi(phdr.p_offset) <= rdi(shdr.sh_offset) &&
+                        rdi(shdr.sh_size) <= rdi(phdr.p_filesz)) {
+                        loaded = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!loaded) {
+                debug("section '%s' was moved out of a load segment\n", sectionName.c_str());
+
+                for (auto & phdr : phdrs) {
+                    if (rdi(phdr.p_type) == PT_LOAD) {
+                        if (rdi(shdr.sh_offset) < rdi(phdr.p_offset)) {
+                            auto gap = rdi(phdr.p_offset) - rdi(shdr.sh_offset);
+
+                            debug("growing PT_LOAD segment by 0x%x to cover '%s'\n",
+                                gap, sectionName.c_str());
+
+                            wri(phdr.p_filesz, rdi(phdr.p_filesz) + gap);
+                            wri(phdr.p_memsz, rdi(phdr.p_memsz) + gap);
+                            phdr.p_vaddr = phdr.p_paddr = shdr.sh_addr;
+                            phdr.p_offset = shdr.sh_offset;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 
@@ -801,49 +856,38 @@ void ElfFile<ElfFileParamNames>::rewriteSectionsLibrary()
        at the end of the file.  They're mapped into memory by a
        PT_LOAD segment located directly after the last virtual address
        page of other segments. */
-    Elf_Addr startPage = 0;
-    Elf_Addr firstPage = 0;
-    unsigned alignStartPage = getPageSize();
+    Elf_Addr firstAddr = 0;
+    Elf_Addr lastAddr = 0;
+    unsigned alignLastAddr = getPageSize();
+
     for (auto & phdr : phdrs) {
-        Elf_Addr thisPage = rdi(phdr.p_vaddr) + rdi(phdr.p_memsz);
-        if (thisPage > startPage) startPage = thisPage;
-        if (rdi(phdr.p_type) == PT_PHDR) firstPage = rdi(phdr.p_vaddr) - rdi(phdr.p_offset);
+        Elf_Addr thisAddr = rdi(phdr.p_vaddr) + rdi(phdr.p_memsz);
+        if (thisAddr > lastAddr) lastAddr = thisAddr;
+        if (rdi(phdr.p_type) == PT_PHDR) firstAddr = rdi(phdr.p_vaddr) - rdi(phdr.p_offset);
         unsigned thisAlign = rdi(phdr.p_align);
-        alignStartPage = std::max(alignStartPage, thisAlign);
+        alignLastAddr = std::max(alignLastAddr, thisAlign);
     }
 
-    startPage = roundUp(startPage, alignStartPage);
+    lastAddr = roundUp(lastAddr, alignLastAddr);
 
-    debug("last page is 0x%llx\n", (unsigned long long) startPage);
-    debug("first page is 0x%llx\n", (unsigned long long) firstPage);
+    debug("first address is 0x%llx\n", (unsigned long long) firstAddr);
+    debug("last address is 0x%llx\n", (unsigned long long) lastAddr);
 
     /* When normalizing note segments we will in the worst case be adding
        1 program header for each SHT_NOTE section. */
     unsigned int num_notes = std::count_if(shdrs.begin(), shdrs.end(),
         [this](Elf_Shdr shdr) { return rdi(shdr.sh_type) == SHT_NOTE; });
 
-    /* Because we're adding a new section header, we're necessarily increasing
-       the size of the program header table.  This can cause the first section
-       to overlap the program header table in memory; we need to shift the first
-       few segments to someplace else. */
-    /* Some sections may already be replaced so account for that */
-    unsigned int i = 1;
-    Elf_Addr pht_size = sizeof(Elf_Ehdr) + (phdrs.size() + num_notes + 1)*sizeof(Elf_Phdr);
-    while( i < rdi(hdr()->e_shnum) && rdi(shdrs.at(i).sh_offset) <= pht_size ) {
-        if (not haveReplacedSection(getSectionName(shdrs.at(i))))
-            replaceSection(getSectionName(shdrs.at(i)), rdi(shdrs.at(i).sh_size));
-        i++;
+    /* Compute the total space needed for the replaced sections, pessimistically
+       assuming we're going to need one more to account for `needNewSegment` */
+    Elf_Addr phtSize = roundUp((phdrs.size() + num_notes + 1) * sizeof(Elf_Phdr), sectionAlignment);
+    off_t shtSize = roundUp(rdi(hdr()->e_shnum) * rdi(hdr()->e_shentsize), sectionAlignment);
+    off_t neededSpace = phtSize + shtSize;
+
+    for (auto & s : replacedSections) {
+        neededSpace += roundUp(s.second.data.size(), sectionAlignment);
     }
-    bool moveHeaderTableToTheEnd = rdi(hdr()->e_shoff) < pht_size;
 
-    /* Compute the total space needed for the replaced sections */
-    off_t neededSpace = 0;
-    for (auto & s : replacedSections)
-        neededSpace += roundUp(s.second.size(), sectionAlignment);
-
-    off_t headerTableSpace = roundUp(rdi(hdr()->e_shnum) * rdi(hdr()->e_shentsize), sectionAlignment);
-    if (moveHeaderTableToTheEnd)
-        neededSpace += headerTableSpace;
     debug("needed space is %d\n", neededSpace);
 
     Elf_Off startOffset = roundUp(fileContents->size(), getPageSize());
@@ -852,37 +896,20 @@ void ElfFile<ElfFileParamNames>::rewriteSectionsLibrary()
     // section segment is strictly smaller than the file (and not same size).
     // By making it one byte larger, we don't break readelf.
     off_t binutilsQuirkPadding = 1;
+
     fileContents->resize(startOffset + neededSpace + binutilsQuirkPadding, 0);
-
-    /* Even though this file is of type ET_DYN, it could actually be
-       an executable.  For instance, Gold produces executables marked
-       ET_DYN as does LD when linking with pie. If we move PT_PHDR, it
-       has to stay in the first PT_LOAD segment or any subsequent ones
-       if they're continuous in memory due to linux kernel constraints
-       (see BUGS). Since the end of the file would be after bss, we can't
-       move PHDR there, we therefore choose to leave PT_PHDR where it is but
-       move enough following sections such that we can add the extra PT_LOAD
-       section to it. This PT_LOAD segment ensures the sections at the end of
-       the file are mapped into memory for ld.so to process.
-       We can't use the approach in rewriteSectionsExecutable()
-       since DYN executables tend to start at virtual address 0, so
-       rewriteSectionsExecutable() won't work because it doesn't have
-       any virtual address space to grow downwards into. */
-    if (isExecutable && startOffset > startPage) {
-        debug("shifting new PT_LOAD segment by %d bytes to work around a Linux kernel bug\n", startOffset - startPage);
-        startPage = startOffset;
-    }
-
-    wri(hdr()->e_phoff, sizeof(Elf_Ehdr));
 
     bool needNewSegment = true;
     auto& lastSeg = phdrs.back();
-    /* Try to extend the last segment to include replaced sections */
+
+    /* As an optimization, instead of allocating a new PT_LOAD segment, try
+       expanding the last segment */
     if (!phdrs.empty() &&
         rdi(lastSeg.p_type) == PT_LOAD &&
         rdi(lastSeg.p_flags) == (PF_R | PF_W) &&
-        rdi(lastSeg.p_align) == alignStartPage) {
+        rdi(lastSeg.p_align) == alignLastAddr) {
         auto segEnd = roundUp(rdi(lastSeg.p_offset) + rdi(lastSeg.p_memsz), getPageSize());
+
         if (segEnd == startOffset) {
             auto newSz = startOffset + neededSpace - rdi(lastSeg.p_offset);
             wri(lastSeg.p_filesz, wri(lastSeg.p_memsz, newSz));
@@ -897,29 +924,39 @@ void ElfFile<ElfFileParamNames>::rewriteSectionsLibrary()
         Elf_Phdr & phdr = phdrs.at(rdi(hdr()->e_phnum) - 1);
         wri(phdr.p_type, PT_LOAD);
         wri(phdr.p_offset, startOffset);
-        wri(phdr.p_vaddr, wri(phdr.p_paddr, startPage));
+        wri(phdr.p_vaddr, wri(phdr.p_paddr, lastAddr));
         wri(phdr.p_filesz, wri(phdr.p_memsz, neededSpace));
         wri(phdr.p_flags, PF_R | PF_W);
-        wri(phdr.p_align, alignStartPage);
+        wri(phdr.p_align, alignLastAddr);
     }
 
     normalizeNoteSegments();
 
-
     /* Write out the replaced sections. */
-    Elf_Off curOff = startOffset;
+    Elf_Off currOffset = startOffset;
 
-    if (moveHeaderTableToTheEnd) {
-        debug("Moving the shtable to offset %d\n", curOff);
-        wri(hdr()->e_shoff, curOff);
-        curOff += headerTableSpace;
-    }
+    debug("rewriting pht from offset 0x%x to offset 0x%x\n",
+        rdi(hdr()->e_phoff), currOffset);
 
-    writeReplacedSections(curOff, startPage, startOffset);
-    assert(curOff == startOffset + neededSpace);
+    wri(hdr()->e_phoff, currOffset);
+    currOffset += phtSize;
 
-    /* Write out the updated program and section headers */
-    rewriteHeaders(firstPage + rdi(hdr()->e_phoff));
+    // ---
+
+    debug("rewriting sht from offset 0x%x to offset 0x%x\n",
+        rdi(hdr()->e_phoff), currOffset);
+
+    wri(hdr()->e_shoff, currOffset);
+    currOffset += shtSize;
+
+    // ---
+
+    writeReplacedSections(currOffset, lastAddr, startOffset);
+    assert(currOffset == startOffset + neededSpace);
+
+    // ---
+
+    rewriteHeaders(lastAddr);
 }
 
 static bool noSort = false;
@@ -1008,7 +1045,7 @@ void ElfFile<ElfFileParamNames>::rewriteSectionsExecutable()
        ELF header, and the program headers. */
     size_t neededSpace = sizeof(Elf_Ehdr) + phdrs.size() * sizeof(Elf_Phdr);
     for (auto & i : replacedSections)
-        neededSpace += roundUp(i.second.size(), sectionAlignment);
+        neededSpace += roundUp(i.second.data.size(), sectionAlignment);
 
     debug("needed space is %d\n", neededSpace);
 
@@ -1058,7 +1095,6 @@ void ElfFile<ElfFileParamNames>::rewriteSectionsExecutable()
     writeReplacedSections(curOff, firstPage, 0);
     assert(curOff == neededSpace);
 
-
     rewriteHeaders(firstPage + rdi(hdr()->e_phoff));
 }
 
@@ -1072,7 +1108,7 @@ void ElfFile<ElfFileParamNames>::normalizeNoteSegments()
 
     /* We don't need to do anything if no note segments were replaced. */
     bool replaced_note = std::any_of(replacedSections.begin(), replacedSections.end(),
-        [this](std::pair<const std::string, std::string> & i) { return rdi(findSectionHeader(i.first).sh_type) == SHT_NOTE; });
+        [this](std::pair<const std::string, auto> & i) { return rdi(findSectionHeader(i.first).sh_type) == SHT_NOTE; });
     if (!replaced_note) return;
 
     std::vector<Elf_Phdr> newPhdrs;
@@ -1139,7 +1175,7 @@ void ElfFile<ElfFileParamNames>::rewriteSections(bool force)
 
     for (auto & i : replacedSections)
         debug("replacing section '%s' with size %d\n",
-            i.first.c_str(), i.second.size());
+            i.first.c_str(), i.second.data.size());
 
     if (rdi(hdr()->e_type) == ET_DYN) {
         debug("this is a dynamic library\n");
@@ -1152,7 +1188,7 @@ void ElfFile<ElfFileParamNames>::rewriteSections(bool force)
 
 
 template<ElfFileParams>
-void ElfFile<ElfFileParamNames>::rewriteHeaders(Elf_Addr phdrAddress)
+void ElfFile<ElfFileParamNames>::rewriteHeaders(Elf_Addr phdrAddr)
 {
     /* Rewrite the program header table. */
 
@@ -1161,7 +1197,7 @@ void ElfFile<ElfFileParamNames>::rewriteHeaders(Elf_Addr phdrAddress)
     for (auto & phdr : phdrs) {
         if (rdi(phdr.p_type) == PT_PHDR) {
             phdr.p_offset = hdr()->e_phoff;
-            wri(phdr.p_vaddr, wri(phdr.p_paddr, phdrAddress));
+            wri(phdr.p_vaddr, wri(phdr.p_paddr, phdrAddr));
             wri(phdr.p_filesz, wri(phdr.p_memsz, phdrs.size() * sizeof(Elf_Phdr)));
             break;
         }
@@ -1178,9 +1214,11 @@ void ElfFile<ElfFileParamNames>::rewriteHeaders(Elf_Addr phdrAddress)
     /* Rewrite the section header table.  For neatness, keep the
        sections sorted. */
     assert(rdi(hdr()->e_shnum) == shdrs.size());
+
     if (!noSort) {
         sortShdrs();
     }
+
     for (unsigned int i = 1; i < rdi(hdr()->e_shnum); ++i)
         * ((Elf_Shdr *) (fileContents->data() + rdi(hdr()->e_shoff)) + i) = shdrs.at(i);
 
@@ -1262,7 +1300,7 @@ void ElfFile<ElfFileParamNames>::rewriteHeaders(Elf_Addr phdrAddress)
                        is broken, and it's not our job to fix it; yet, we have
                        to find some location for dynamic loader to write the
                        debug pointer to; well, let's write it right here */
-                    fprintf(stderr, "warning: DT_MIPS_RLD_MAP_REL entry is present, but .rld_map section is not\n");
+                    warn("DT_MIPS_RLD_MAP_REL entry is present, but .rld_map section is not\n");
                     dyn->d_un.d_ptr = 0;
                 }
             }
@@ -1274,26 +1312,109 @@ void ElfFile<ElfFileParamNames>::rewriteHeaders(Elf_Addr phdrAddress)
        remapped. */
     for (unsigned int i = 1; i < rdi(hdr()->e_shnum); ++i) {
         auto &shdr = shdrs.at(i);
-        if (rdi(shdr.sh_type) != SHT_SYMTAB && rdi(shdr.sh_type) != SHT_DYNSYM) continue;
-        debug("rewriting symbol table section %d\n", i);
+
+        if (rdi(shdr.sh_type) != SHT_SYMTAB && rdi(shdr.sh_type) != SHT_DYNSYM) {
+            continue;
+        }
+
+        debug("rewriting symbol table (section %d)\n", i);
+        
         for (size_t entry = 0; (entry + 1) * sizeof(Elf_Sym) <= rdi(shdr.sh_size); entry++) {
             auto sym = (Elf_Sym *)(fileContents->data() + rdi(shdr.sh_offset) + entry * sizeof(Elf_Sym));
             unsigned int shndx = rdi(sym->st_shndx);
-            if (shndx != SHN_UNDEF && shndx < SHN_LORESERVE) {
-                if (shndx >= sectionsByOldIndex.size()) {
-                    fprintf(stderr, "warning: entry %d in symbol table refers to a non-existent section, skipping\n", shndx);
-                    continue;
-                }
-                const std::string & section = sectionsByOldIndex.at(shndx);
-                assert(!section.empty());
-                auto newIndex = getSectionIndex(section); // inefficient
-                //debug("rewriting symbol %d: index = %d (%s) -> %d\n", entry, shndx, section.c_str(), newIndex);
-                wri(sym->st_shndx, newIndex);
-                /* Rewrite st_value.  FIXME: we should do this for all
-                   types, but most don't actually change. */
-                if (ELF32_ST_TYPE(rdi(sym->st_info)) == STT_SECTION)
-                    wri(sym->st_value, rdi(shdrs.at(newIndex).sh_addr));
+
+            if (shndx == SHN_UNDEF || shndx >= SHN_LORESERVE) {
+                continue;
             }
+
+            if (shndx >= sectionsByOldIndex.size()) {
+                warn(
+                    "entry %d refers to a non-existent section (%d), skipping\n",
+                    entry,
+                    shndx
+                );
+
+                continue;
+            }
+
+            const std::string & section = sectionsByOldIndex.at(shndx);
+            assert(!section.empty());
+
+            auto newIndex = getSectionIndex(section);
+            auto newValue = rdi(sym->st_value);
+
+            if (ELF32_ST_TYPE(rdi(sym->st_info)) == STT_SECTION) {
+                newValue = rdi(shdrs.at(newIndex).sh_addr);
+            } else {
+                auto rs = replacedSections.find(section);
+
+                if (rs == replacedSections.end()) {
+                    // Entry refers to a section that didn't got moved around
+                    // (we still might have to update shndx, though)
+                } else {
+                    if (rdi(sym->st_value) < rs->second.prev_addr) {
+                        warn("entry %d refers to an address outside the section, skipping\n", entry);
+                        continue;
+                    } else {
+                        newValue = rdi(sym->st_value) - rs->second.prev_addr + rdi(shdrs.at(newIndex).sh_addr);
+                    }
+                }
+            }
+
+            auto oldIndex = rdi(sym->st_shndx);
+            auto oldValue = rdi(sym->st_value);
+
+            if (newIndex == oldIndex && newValue == oldValue) {
+                // No point in spamming logs if nothing got changed
+                continue;
+            }
+
+            debug(
+                "rewriting entry %d: shndx=%d->%d (%s), value=%d->%d\n",
+                entry,
+                (size_t) oldIndex,
+                (size_t) newIndex,
+                section.c_str(),
+                (size_t) oldValue,
+                (size_t) newValue
+            );
+
+            wri(sym->st_shndx, newIndex);
+            wri(sym->st_value, newValue);
+        }
+    }
+
+    /* Rewrite the .rela.dyn section */
+    for (unsigned int i = 1; i < rdi(hdr()->e_shnum); ++i) {
+        auto &shdr = shdrs.at(i);
+
+        if (rdi(shdr.sh_type) != SHT_RELA) {
+            continue;
+        }
+
+        debug("rewriting relocations (section %d)\n", i);
+
+        unsigned int r_idx = 0;
+
+        for (auto& r: getSectionSpan<Elf64_Rela>(shdr)) {
+            if (ELF64_R_TYPE(r.r_info) == R_X86_64_RELATIVE) {
+                for (auto & rs : replacedSections) {
+                    size_t oldAddend = rdi(r.r_addend);
+
+                    if (oldAddend >= rs.second.prev_addr &&
+                        oldAddend <= rs.second.prev_addr + rs.second.prev_size) {
+                        Elf64_Sxword newAddend = oldAddend - rs.second.prev_addr + shdrs.at(getSectionIndex(rs.first)).sh_addr;
+
+                        debug("rewriting entry %d: addend=%d->%d\n",
+                            r_idx, (size_t) oldAddend, (size_t) newAddend);
+
+                        wri(r.r_addend, newAddend);
+                        break;
+                    }
+                }
+            }
+
+            r_idx += 1;
         }
     }
 }
